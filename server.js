@@ -19,11 +19,14 @@ let browserPromise = null;
 function getBrowser() {
   if (!browserPromise) {
     browserPromise = chromium.launch({
-      headless: true,
+      headless: "new",
       args: [
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--no-first-run",
+        "--disable-extensions",
       ],
     }).catch((e) => {
       browserPromise = null;
@@ -57,6 +60,15 @@ app.post("/transcript", async (req, res) => {
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
       locale: "en-US",
       viewport: { width: 1280, height: 800 },
+      extraHTTPHeaders: {
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+    // Hide webdriver flag and other bot fingerprints before any page script runs.
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
     });
     const page = await context.newPage();
     page.setDefaultTimeout(20_000);
@@ -68,9 +80,27 @@ app.post("/transcript", async (req, res) => {
       return route.continue();
     });
 
-    await page.goto(`https://www.youtube.com/watch?v=${videoId}&hl=en`, {
-      waitUntil: "domcontentloaded",
-    });
+    // Try desktop YouTube first; fall back to mobile (less aggressive bot UI).
+    const urls = [
+      `https://www.youtube.com/watch?v=${videoId}&hl=en`,
+      `https://m.youtube.com/watch?v=${videoId}&hl=en`,
+    ];
+    let pageUrl = null;
+    for (const u of urls) {
+      await page.goto(u, { waitUntil: "domcontentloaded" });
+      const html = await page.content();
+      if (/ytInitialPlayerResponse\s*=/.test(html)) {
+        pageUrl = u;
+        break;
+      }
+    }
+    if (!pageUrl) {
+      const title = await page.title().catch(() => "?");
+      const finalUrl = page.url();
+      return res.status(502).json({
+        error: `Bot-blocked or unrecognized page (title="${title}" url=${finalUrl})`,
+      });
+    }
 
     // Dismiss EU consent if present (some regions).
     await page.locator('button[aria-label*="Accept" i]').first().click({ timeout: 2500 }).catch(() => {});
