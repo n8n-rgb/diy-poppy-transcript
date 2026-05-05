@@ -1,0 +1,16 @@
+{
+  "name": "diy-poppy-transcript",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright-core": "^1.49.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

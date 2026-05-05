@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: diy-poppy-transcript
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: SHARED_SECRET
+        generateValue: true
+      - key: PORT
+        value: "3000"
