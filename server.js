@@ -1,6 +1,10 @@
 // Playwright-backed YouTube transcript service.
-// Deploys to Render free tier. Uses a real Chromium so YouTube's BotGuard
-// is satisfied and the transcript panel renders normally.
+//
+// Strategy: open the watch page in a real Chromium so YouTube's player
+// initializes (and mints a session PO token in its own context). Extract
+// the captionTracks baseUrl from ytInitialPlayerResponse, then fetch the
+// timedtext JSON3 from inside that page so the request reuses YouTube's
+// own session cookies/headers — bypassing the unauthenticated lockout.
 
 import express from "express";
 import { chromium } from "playwright-core";
@@ -8,7 +12,7 @@ import { chromium } from "playwright-core";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-const SHARED_SECRET = process.env.SHARED_SECRET; // required in prod
+const SHARED_SECRET = process.env.SHARED_SECRET;
 const PORT = Number(process.env.PORT ?? 3000);
 
 let browserPromise = null;
@@ -21,7 +25,6 @@ function getBrowser() {
         "--disable-dev-shm-usage",
         "--disable-blink-features=AutomationControlled",
       ],
-      executablePath: process.env.CHROMIUM_PATH || undefined,
     }).catch((e) => {
       browserPromise = null;
       throw e;
@@ -31,7 +34,7 @@ function getBrowser() {
 }
 
 function authOk(req) {
-  if (!SHARED_SECRET) return true; // dev mode
+  if (!SHARED_SECRET) return true;
   return req.get("authorization") === `Bearer ${SHARED_SECRET}`;
 }
 
@@ -40,7 +43,7 @@ app.get("/healthz", (_req, res) => res.json({ ok: true }));
 app.post("/transcript", async (req, res) => {
   if (!authOk(req)) return res.status(401).json({ error: "unauthorized" });
 
-  const { videoId } = req.body ?? {};
+  const { videoId, lang = "en" } = req.body ?? {};
   if (!/^[\w-]{11}$/.test(videoId ?? "")) {
     return res.status(400).json({ error: "missing or invalid videoId" });
   }
@@ -61,7 +64,7 @@ app.post("/transcript", async (req, res) => {
     // Block heavy assets — speeds up first paint dramatically.
     await page.route("**/*", (route) => {
       const t = route.request().resourceType();
-      if (t === "image" || t === "media" || t === "font") return route.abort();
+      if (t === "image" || t === "media" || t === "font" || t === "stylesheet") return route.abort();
       return route.continue();
     });
 
@@ -69,34 +72,67 @@ app.post("/transcript", async (req, res) => {
       waitUntil: "domcontentloaded",
     });
 
-    // Dismiss the EU consent dialog if present.
-    await page.locator('button[aria-label*="Accept" i]').first().click({ timeout: 3000 }).catch(() => {});
-    await page.locator('form[action*="consent"] button').first().click({ timeout: 3000 }).catch(() => {});
+    // Dismiss EU consent if present (some regions).
+    await page.locator('button[aria-label*="Accept" i]').first().click({ timeout: 2500 }).catch(() => {});
+    await page.locator('form[action*="consent"] button').first().click({ timeout: 2500 }).catch(() => {});
 
-    // Click the description "...more" expander.
-    await page
-      .locator('tp-yt-paper-button#expand, ytd-text-inline-expander #expand')
-      .first()
-      .click({ timeout: 8000 });
+    // Read ytInitialPlayerResponse from the page.
+    const playerResponse = await page.evaluate(() => {
+      // eslint-disable-next-line no-undef
+      return window.ytInitialPlayerResponse ?? null;
+    });
 
-    // Click "Show transcript" button.
-    await page
-      .getByRole("button", { name: /show transcript/i })
-      .first()
-      .click({ timeout: 8000 });
+    if (!playerResponse) {
+      return res.status(500).json({ error: "ytInitialPlayerResponse not found" });
+    }
 
-    // Wait for transcript segments to render.
-    const segLoc = page.locator("ytd-transcript-segment-renderer .segment-text, ytd-transcript-segment-renderer yt-formatted-string.segment-text");
-    await segLoc.first().waitFor({ timeout: 15_000 });
+    const tracks =
+      playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+    if (!tracks.length) {
+      return res.status(404).json({ error: "this video has no captions" });
+    }
 
-    // Some videos have section headers; just grab segment-text spans.
-    const segments = await segLoc.allInnerTexts();
-    const text = segments.map((s) => s.replace(/\s+/g, " ").trim()).filter(Boolean).join(" ");
+    // Prefer requested lang, manual over asr; fall back to first.
+    const pick =
+      tracks.find((t) => t.languageCode === lang && !t.kind) ||
+      tracks.find((t) => t.languageCode === lang) ||
+      tracks.find((t) => !t.kind) ||
+      tracks[0];
+    const baseUrl = pick?.baseUrl;
+    if (!baseUrl) {
+      return res.status(404).json({ error: "no captionTrack baseUrl" });
+    }
+
+    // Fetch the timedtext URL from inside the browser context — this carries
+    // the page's session cookies and PO token, which the unauthenticated
+    // server-side fetch lacks.
+    const captionUrl = baseUrl + "&fmt=json3";
+    const json = await page.evaluate(async (url) => {
+      const r = await fetch(url, { credentials: "include" });
+      if (!r.ok) return { __status: r.status };
+      try {
+        return await r.json();
+      } catch {
+        const text = await r.text();
+        return { __body: text };
+      }
+    }, captionUrl);
+
+    if (json?.__status) {
+      return res.status(502).json({ error: `timedtext returned ${json.__status}` });
+    }
+
+    const events = json?.events ?? [];
+    const text = events
+      .flatMap((e) => (e?.segs ?? []).map((s) => s?.utf8 ?? ""))
+      .join("")
+      .replace(/\s+/g, " ")
+      .trim();
 
     if (!text) {
-      return res.status(404).json({ error: "transcript empty after extraction" });
+      return res.status(404).json({ error: "transcript empty after parsing" });
     }
-    return res.json({ text, ms: Date.now() - t0 });
+    return res.json({ text, ms: Date.now() - t0, source: pick.kind === "asr" ? "auto" : "manual" });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return res.status(500).json({ error: msg });
