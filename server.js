@@ -19,7 +19,7 @@ let browserPromise = null;
 function getBrowser() {
   if (!browserPromise) {
     browserPromise = chromium.launch({
-      headless: "new",
+      headless: true,
       args: [
         "--no-sandbox",
         "--disable-dev-shm-usage",
