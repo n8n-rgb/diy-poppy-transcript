@@ -76,14 +76,32 @@ app.post("/transcript", async (req, res) => {
     await page.locator('button[aria-label*="Accept" i]').first().click({ timeout: 2500 }).catch(() => {});
     await page.locator('form[action*="consent"] button').first().click({ timeout: 2500 }).catch(() => {});
 
-    // Read ytInitialPlayerResponse from the page.
-    const playerResponse = await page.evaluate(() => {
+    // Resolve ytInitialPlayerResponse: prefer window global, fall back to
+    // regex over the rendered HTML (the inline script that sets it).
+    let playerResponse = await page.evaluate(() => {
       // eslint-disable-next-line no-undef
       return window.ytInitialPlayerResponse ?? null;
     });
 
     if (!playerResponse) {
-      return res.status(500).json({ error: "ytInitialPlayerResponse not found" });
+      const html = await page.content();
+      const m = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;\s*(?:var|<\/script)/s);
+      if (m) {
+        try { playerResponse = JSON.parse(m[1]); } catch { /* fall through */ }
+      }
+    }
+
+    if (!playerResponse) {
+      // One more retry: wait for the player to initialize then re-check the global.
+      await page.waitForFunction(() => "ytInitialPlayerResponse" in window, { timeout: 10_000 }).catch(() => {});
+      playerResponse = await page.evaluate(() => {
+        // eslint-disable-next-line no-undef
+        return window.ytInitialPlayerResponse ?? null;
+      });
+    }
+
+    if (!playerResponse) {
+      return res.status(500).json({ error: "ytInitialPlayerResponse not found in window or HTML" });
     }
 
     const tracks =
